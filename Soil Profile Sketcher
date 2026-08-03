@@ -1,0 +1,174 @@
+# Soil Profile Sketcher
+
+# Load necessary packages
+library(shiny)
+library(aqp)
+library(RColorBrewer)
+library(latticeExtra)
+library(plyr)
+library(reshape)
+
+# --- Helper Function: Column Standardization ---
+standardize_columns <- function(df) {
+  # Map standard internal target names to candidate patterns/regex
+  column_patterns <- list(
+    Profile      = "^(profile|id|pedon|pedon_id|profile_id|site)$",
+    top          = "^(top|top_depth|hzdept|topdepth|depth_top|dept)$",
+    bottom       = "^(bottom|bottom_depth|hzdepb|botdepth|depth_bottom|depb|bot)$",
+    Hue          = "^(hue|munsell_hue|color_hue)$",
+    Value        = "^(value|munsell_value|color_value|val)$",
+    Chroma       = "^(chroma|munsell_chroma|color_chroma|chr)$",
+    Horizon.Name = "^(horizon_name|horizonname|hzname|horizon|hz_name|name)$"
+  )
+  
+  # Clean existing column names (lowercase, remove spaces/dots/underscores)
+  cleaned_names <- tolower(gsub("[._ ]", "", names(df)))
+  
+  new_names <- names(df)
+  
+  for (target in names(column_patterns)) {
+    pattern <- column_patterns[[target]]
+    match_idx <- which(grepl(pattern, cleaned_names, ignore.case = TRUE))
+    
+    if (length(match_idx) > 0) {
+      # Use the first matching column
+      new_names[match_idx[1]] <- target
+    }
+  }
+  
+  names(df) <- new_names
+  return(df)
+}
+
+# --- Define UI ---
+ui <- fluidPage(
+  titlePanel("Flexible Soil Profile Sketcher"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("file1", "Choose CSV File",
+                multiple = FALSE,
+                accept = c("text/csv",
+                           "text/comma-separated-values,text/plain",
+                           ".csv")),
+      tags$hr(),
+      checkboxInput("header", "Header", TRUE),
+      radioButtons("sep", "Separator",
+                   choices = c(Comma = ",",
+                               Semicolon = ";",
+                               Tab = "\t"),
+                   selected = ","),
+      radioButtons("quote", "Quote",
+                   choices = c(None = "",
+                               "Double Quote" = '"',
+                               "Single Quote" = "'"),
+                   selected = '"'),
+      tags$hr(),
+      # Sliders for controlling plot width and height
+      sliderInput("plotWidth", "Plot Width (pixels):",
+                  min = 400, max = 1600, value = 900, step = 50),
+      sliderInput("plotHeight", "Plot Height (pixels):",
+                  min = 300, max = 1200, value = 700, step = 50),
+      tags$hr(),
+      helpText(
+        "Your CSV file must include columns for (case and format flexible):",
+        tags$ul(
+          tags$li("Profile (e.g., Profile, ID, Pedon_ID)"),
+          tags$li("Top Depth (e.g., top, top_depth, hzdept)"),
+          tags$li("Bottom Depth (e.g., bottom, bottom_depth, hzdepb)"),
+          tags$li("Hue (e.g., Hue, Color_Hue)"),
+          tags$li("Value (e.g., Value, Val)"),
+          tags$li("Chroma (e.g., Chroma, Chr)"),
+          tags$li("Horizon Name (e.g., Horizon.Name, hzname, Name)")
+        )
+      )
+    ),
+    
+    mainPanel(
+      h3("Soil Profile Sketch with Depth Labeling"),
+      fluidRow(
+        column(12, align = "center",
+               plotOutput("profilePlot",
+                          width = "auto",
+                          height = "auto")
+        )
+      )
+    )
+  )
+)
+
+# --- Define Server ---
+server <- function(input, output) {
+  
+  pedon_data <- reactive({
+    req(input$file1)
+    
+    inFile <- input$file1
+    
+    df <- read.csv(inFile$datapath,
+                   header = input$header,
+                   sep = input$sep,
+                   quote = input$quote,
+                   stringsAsFactors = FALSE)
+    
+    # Automatically standardize input header names
+    df <- standardize_columns(df)
+    
+    # Required columns target
+    required_cols <- c("Profile", "top", "bottom",
+                       "Hue", "Value", "Chroma", "Horizon.Name")
+    
+    # User-friendly validation error if columns are missing
+    missing_cols <- setdiff(required_cols, names(df))
+    validate(
+      need(length(missing_cols) == 0, 
+           paste0("Could not match the following required column(s): ", 
+                  paste(missing_cols, collapse = ", "), 
+                  ".\nFound columns: ", paste(names(df), collapse = ", ")))
+    )
+    
+    # Convert numeric attributes in case they were read as strings
+    df$top <- as.numeric(df$top)
+    df$bottom <- as.numeric(df$bottom)
+    df$Value <- as.numeric(df$Value)
+    df$Chroma <- as.numeric(df$Chroma)
+    df$Hue <- as.character(df$Hue)
+    
+    # Color convert Munsell to RGB
+    df$color <- munsell2rgb(df$Hue, df$Value, df$Chroma)
+    
+    # Create combined label
+    df$label <- paste(df$Profile, df$Horizon.Name, sep = " , ")
+    
+    # Convert to SoilProfileCollection object
+    depths(df) <- Profile ~ top + bottom
+    return(df)
+  })
+  
+  output$profilePlot <- renderPlot({
+    pedon <- pedon_data()
+    if (!is.null(pedon)) {
+      old_par <- par(no.readonly = TRUE)
+      on.exit(par(old_par))
+      
+      par(mar = c(0.5, 0.5, 0.5, 0.5))
+      
+      plot(pedon,
+           name = 'Horizon.Name',
+           color = 'color',
+           cex.names = 0.7,
+           width = 0.3,
+           depth.axis = FALSE,
+           hz.depths = TRUE,
+           fixLabelCollisions = TRUE,
+           hz.depths.offset = 0.08)
+    }
+  },
+  res = 96,
+  width = function() input$plotWidth,
+  height = function() input$plotHeight
+  )
+}
+
+# --- Run App ---
+shinyApp(ui = ui, server = server)
