@@ -1,0 +1,266 @@
+library(shiny)
+library(bslib)
+library(leaflet)
+library(sf)
+library(stars)
+library(terra)
+library(gstat)
+library(DT)
+library(viridis)
+library(ggplot2) # Added for HD plot generation
+
+# Define UI
+ui <- page_sidebar(
+  theme = bs_theme(bootswatch = "flatly", primary = "#2c3e50"),
+  title = "Soil Spatial Interpolation & Mapping Tool",
+  
+  sidebar = sidebar(
+    title = "Control Panel",
+    width = 340,
+    
+    fileInput("file", "1. Upload Soil Dataset (CSV)",
+              accept = c("text/csv", "text/comma-separated-values,text/plain", ".csv")),
+    
+    hr(),
+    uiOutput("ui_coord_select"),
+    uiOutput("ui_param_select"),
+    
+    hr(),
+    selectInput("method", "4. Select Interpolation Method",
+                choices = c("Inverse Distance Weighting (IDW)" = "idw",
+                            "Ordinary Kriging" = "kriging")),
+    
+    numericInput("grid_res", "5. Grid Resolution (cells per axis)", 
+                 value = 150, min = 20, max = 500, step = 10),
+    
+    selectInput("palette", "6. Color Palette",
+                choices = c("Viridis" = "viridis", "Magma" = "magma", 
+                            "Spectral" = "Spectral", "YlOrRd" = "YlOrRd")),
+    
+    actionButton("btn_run", "Generate Soil Map", class = "btn-primary w-100", icon = icon("layer-group")),
+    
+    hr(),
+    h5("HD Export Options"),
+    selectInput("export_format", "Format", choices = c("PNG" = "png", "PDF" = "pdf", "TIFF" = "tiff")),
+    numericInput("export_dpi", "DPI (Quality)", value = 300, min = 150, max = 600, step = 50),
+    downloadButton("btn_download_hd", "Download HD Map", class = "btn-success w-100")
+  ),
+  
+  navset_card_tab(
+    nav_panel(
+      title = "Interactive Map",
+      icon = icon("map"),
+      leafletOutput("soil_map", height = "700px")
+    ),
+    nav_panel(
+      title = "HD Static Preview",
+      icon = icon("image"),
+      plotOutput("hd_preview_plot", height = "700px")
+    ),
+    nav_panel(
+      title = "Data Preview",
+      icon = icon("table"),
+      DTOutput("data_table")
+    ),
+    nav_panel(
+      title = "Summary & Variogram",
+      icon = icon("chart-line"),
+      verbatimTextOutput("summary_text"),
+      plotOutput("variogram_plot", height = "400px")
+    )
+  )
+)
+
+# Define Server
+server <- function(input, output, session) {
+  
+  # Reactive value to store parsed data
+  raw_data <- reactive({
+    req(input$file)
+    read.csv(input$file$datapath, stringsAsFactors = FALSE)
+  })
+  
+  # Dynamic UI for selecting coordinate columns
+  output$ui_coord_select <- renderUI({
+    req(raw_data())
+    cols <- colnames(raw_data())
+    
+    lon_guess <- grep("lon|x|easting|lng", cols, ignore.case = TRUE, value = TRUE)[1]
+    lat_guess <- grep("lat|y|northing", cols, ignore.case = TRUE, value = TRUE)[1]
+    
+    tagList(
+      selectInput("lon_col", "2. Select Longitude / X Column", choices = cols, selected = lon_guess),
+      selectInput("lat_col", "Select Latitude / Y Column", choices = cols, selected = lat_guess)
+    )
+  })
+  
+  # Dynamic UI for selecting numeric soil parameter
+  output$ui_param_select <- renderUI({
+    req(raw_data())
+    num_cols <- names(raw_data())[sapply(raw_data(), is.numeric)]
+    
+    if (!is.null(input$lon_col) && !is.null(input$lat_col)) {
+      num_cols <- setdiff(num_cols, c(input$lon_col, input$lat_col))
+    }
+    
+    selectInput("param_col", "3. Select Soil Parameter to Map", choices = num_cols)
+  })
+  
+  # Data Table Output
+  output$data_table <- renderDT({
+    req(raw_data())
+    datatable(raw_data(), options = list(pageLength = 10, scrollX = TRUE))
+  })
+  
+  # Spatial Interpolation Reaction
+  interpolated_results <- eventReactive(input$btn_run, {
+    req(raw_data(), input$lon_col, input$lat_col, input$param_col)
+    
+    df <- raw_data()
+    lon <- input$lon_col
+    lat <- input$lat_col
+    target_var <- input$param_col
+    
+    df <- df[!is.na(df[[lon]]) & !is.na(df[[lat]]) & !is.na(df[[target_var]]), ]
+    sf_points <- st_as_sf(df, coords = c(lon, lat), crs = 4326)
+    
+    bbox <- st_bbox(sf_points)
+    grid <- stars::st_as_stars(bbox, nx = input$grid_res, ny = input$grid_res)
+    
+    formula_str <- as.formula(paste(target_var, "~ 1"))
+    
+    if (input$method == "idw") {
+      idw_fit <- gstat::idw(formula_str, sf_points, grid)
+      r <- terra::rast(idw_fit["var1.pred"])
+      variogram_obj <- NULL
+    } else {
+      v_emp <- variogram(formula_str, sf_points)
+      v_fit <- fit.variogram(v_emp, model = vgm("Sph"))
+      krig_fit <- krige(formula_str, sf_points, grid, model = v_fit)
+      r <- terra::rast(krig_fit["var1.pred"])
+      variogram_obj <- list(emp = v_emp, fit = v_fit)
+    }
+    
+    names(r) <- "prediction"
+    
+    return(list(
+      raster = r,
+      points = sf_points,
+      param = target_var,
+      variogram = variogram_obj
+    ))
+  })
+  
+  # Render Interactive Leaflet Map
+  output$soil_map <- renderLeaflet({
+    res <- interpolated_results()
+    req(res)
+    
+    r <- res$raster
+    pts <- res$points
+    param <- res$param
+    
+    pal <- colorNumeric(palette = input$palette, domain = values(r), na.color = "transparent")
+    
+    leaflet() %>%
+      addProviderTiles(providers$CartoDB.Positron, group = "Basemap") %>%
+      addRasterImage(r, colors = pal, opacity = 0.75, group = "Interpolated Surface") %>%
+      addCircleMarkers(
+        data = pts,
+        radius = 4,
+        color = "black",
+        weight = 1,
+        fillColor = ~pal(pts[[param]]),
+        fillOpacity = 0.9,
+        popup = ~paste0("<b>", param, ": </b>", round(pts[[param]], 2)),
+        group = "Sampling Points"
+      ) %>%
+      addLegend(pal = pal, values = values(r), title = param, position = "bottomright") %>%
+      addLayersControl(
+        overlayGroups = c("Interpolated Surface", "Sampling Points"),
+        options = layersControlOptions(collapsed = FALSE)
+      )
+  })
+  
+  # Reactive function to generate high-resolution ggplot map
+  build_hd_ggplot <- reactive({
+    res <- interpolated_results()
+    req(res)
+    
+    r_df <- as.data.frame(res$raster, xy = TRUE)
+    pts_df <- st_coordinates(res$points)
+    pts_df <- cbind(as.data.frame(pts_df), value = res$points[[res$param]])
+    
+    method_title <- ifelse(input$method == "idw", "IDW Interpolation", "Ordinary Kriging")
+    
+    p <- ggplot() +
+      geom_raster(data = r_df, aes(x = x, y = y, fill = prediction)) +
+      geom_point(data = pts_df, aes(x = X, y = Y), color = "black", size = 2, shape = 21, fill = "white") +
+      scale_fill_viridis_c(option = tolower(input$palette), name = res$param, na.value = "transparent") +
+      coord_sf(crs = 4326) +
+      theme_bw(base_size = 14) +
+      labs(
+        title = paste("Spatial Distribution Map of", res$param),
+        subtitle = paste("Interpolation Method:", method_title),
+        x = "Longitude",
+        y = "Latitude"
+      ) +
+      theme(
+        plot.title = element_text(face = "bold", size = 16),
+        legend.position = "right",
+        panel.grid.major = element_line(color = "grey90", linetype = "dashed")
+      )
+    
+    return(p)
+  })
+  
+  # Preview static HD map in application tab
+  output$hd_preview_plot <- renderPlot({
+    build_hd_ggplot()
+  })
+  
+  # Download Handler for HD Map
+  output$btn_download_hd <- downloadHandler(
+    filename = function() {
+      paste0("Soil_Map_", input$param_col, "_", Sys.Date(), ".", input$export_format)
+    },
+    content = function(file) {
+      ggsave(
+        filename = file,
+        plot = build_hd_ggplot(),
+        width = 10,
+        height = 8,
+        dpi = input$export_dpi,
+        units = "in",
+        device = input$export_format
+      )
+    }
+  )
+  
+  # Summary Text Output
+  output$summary_text <- renderPrint({
+    res <- interpolated_results()
+    req(res)
+    
+    cat("--- Parameter Summary ---\n")
+    print(summary(res$points[[res$param]]))
+    
+    if (!is.null(res$variogram)) {
+      cat("\n--- Fitted Variogram Model (Kriging) ---\n")
+      print(res$variogram$fit)
+    }
+  })
+  
+  # Variogram Plot
+  output$variogram_plot <- renderPlot({
+    res <- interpolated_results()
+    req(res$variogram)
+    
+    plot(res$variogram$emp, res$variogram$fit, 
+         main = paste("Experimental & Fitted Variogram for", res$param),
+         pch = 19, col = "blue")
+  })
+}
+
+# Run Application
+shinyApp(ui = ui, server = server)
